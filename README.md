@@ -37,7 +37,7 @@ The **data model (§3) is the core of this document** and is identical for both 
 Sunbay automates the collection of overdue receivables (email/SMS reminders and related flows) and provides receivables analytics. To do this, Sunbay needs a continuous feed of your **sales/revenue invoices - both paid and unpaid** - together with the **debtor (customer) data** for each invoice:
 
 - **Unpaid and overdue invoices** drive the collection processes.
-- **Paid invoices** power analytics: payment-behaviour insight, debtor scoring, aging and cash-flow reporting.
+- **Paid invoices** power analytics and reporting across your receivables.
 
 Optionally, the **PDF** of an invoice can be exchanged as well - it is needed **only** when invoice documents should be attached to reminder emails (§3.7).
 
