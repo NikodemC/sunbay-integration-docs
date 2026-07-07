@@ -1,0 +1,11 @@
+title: ERP to Sunbay Integration Guide
+description: Delivering invoice data to Sunbay - client-hosted API (pull) or push ingestion
+theme: jekyll-theme-cayman
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  hard_wrap: false
+
+show_downloads: false
