@@ -65,7 +65,7 @@ Why this is the recommended option:
 - You implement **one read-only endpoint** (plus an optional PDF endpoint) - no scheduler, no retry logic, no outbound delivery pipeline on your side.
 - Sunbay owns scheduling, backfill, retries and pacing - and can adapt them without any change on your side.
 - Cancellations and corrections propagate naturally: Sunbay simply observes the current state of your data.
-- The endpoint can be locked down tightly: Sunbay calls from a stable, published set of egress IP addresses which you can allowlist (§7.2).
+- Documents stay authoritative in your system: PDFs are fetched on demand and never stored by Sunbay (unlike push, where Sunbay must keep a copy).
 
 ### 2.2 Option B - push to Sunbay
 
@@ -80,15 +80,14 @@ Your system pushes each invoice to Sunbay's ingestion endpoints (§5), one call 
 | Scheduling & retries | Owned by Sunbay | Owned by you |
 | Cancellations | Visible as `Cancelled` tombstones in API responses (§4.5) | Require an explicit cancellation signal in incremental mode (§5.3) |
 | Backfill / first load | Sunbay crawls the history via the same API | Bulk file upload or many individual pushes (§5.2) |
-| PDFs (if enabled) | Fetched by Sunbay per invoice, once | Shipped by you together with each push |
+| PDFs (if enabled) | Fetched by Sunbay on demand at each reminder send (no copies kept) | Shipped by you with each push and stored by Sunbay |
 | Tenant identification | Implicit - credentials and base URL are client-specific (§7.2) | `tenantCode` field in every payload (§7.3) |
-| IP allowlisting | Feasible - Sunbay's egress IPs are stable | Generally impractical with dynamic outbound IPs |
 | Result reporting | HTTP responses of your API | Acknowledgment design to be agreed (§5.5) |
 
 ### 2.4 Common to both options
 
 - The **data model (§3)** and **formats (§6)** are identical.
-- **Idempotency** is keyed on `externalInvoiceId` (§8) - re-delivery or re-fetch of the same invoice is a safe update, never a duplicate.
+- **Idempotency** is keyed on `invoiceId` (§8) - re-delivery or re-fetch of the same invoice is a safe update, never a duplicate.
 - Both **paid and unpaid** invoices are in scope.
 - **PDFs are optional** in both options - they are needed only for email attachments (§3.7).
 
@@ -104,10 +103,10 @@ This is the **most important section**. Each invoice exposed to (or pushed to) S
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `externalInvoiceId` | string | **Yes** | Stable, globally-unique identifier of the invoice **in the source system**. Used to recognise the same invoice across syncs (deduplication / update key). Must be **stable** - the same invoice must always carry the same id, even after edits. |
+| `invoiceId` | string | **Yes** | Stable, globally-unique identifier of the invoice **in the source system**. Used to recognise the same invoice across syncs (deduplication / update key). Must be **stable** - the same invoice must always carry the same id, even after edits. |
 | `invoiceNumber` | string | **Yes** | Human-readable invoice number (e.g. `FV/2026/01/0123`). Shown to the debtor in reminders. |
 | `documentType` | enum | **Yes** | Kind of document - see §3.1.1. |
-| `correctedExternalInvoiceId` | string | **Cond.** | When `documentType = CorrectiveInvoice`: the `externalInvoiceId` of the original invoice this document corrects. |
+| `correctedInvoiceId` | string | **Cond.** | When `documentType = CorrectiveInvoice`: the `invoiceId` of the original invoice this document corrects. |
 | `issueDate` | date | **Yes** | Date the invoice was issued. |
 | `dueDate` | date | **Yes** | Payment due date - when the invoice becomes collectible. |
 | `paymentTermDays` | integer | **Opt.** | Payment term in days, if available. |
@@ -128,7 +127,7 @@ This is the **most important section**. Each invoice exposed to (or pushed to) S
 
 #### 3.1.2 Corrections
 
-A corrective document carries `documentType = CorrectiveInvoice` and `correctedExternalInvoiceId` pointing at the original invoice. It adjusts the outstanding amount of the original receivable. **How your source system expresses correction amounts** (the new corrected totals, the difference/delta, or "before/after") must be confirmed during onboarding so the balance is interpreted correctly (§10).
+A corrective document carries `documentType = CorrectiveInvoice` and `correctedInvoiceId` pointing at the original invoice. It adjusts the outstanding amount of the original receivable. **How your source system expresses correction amounts** (the new corrected totals, the difference/delta, or "before/after") must be confirmed during onboarding so the balance is interpreted correctly (§10).
 
 ### 3.2 Amounts & currency
 
@@ -156,7 +155,7 @@ Embedded per invoice. This is the party Sunbay contacts.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `externalCustomerId` | string | **Yes** | Stable, unique identifier of the customer in the source system. |
+| `customerId` | string | **Yes** | Stable, unique identifier of the customer in the source system. |
 | `customerName` | string | **Yes** | Debtor name (company or person). |
 | `customerTaxId` | string | **Rec.** | Tax identifier (e.g. VAT ID / NIP). |
 | `customerEmail` | string | **Rec.** | Primary email. Required for email reminders. |
@@ -173,6 +172,7 @@ Embedded per invoice. This is the party Sunbay contacts.
 |---|---|---|---|
 | `sellerName` | string | **Opt.** | Issuing entity name. A single installation may contain several legal entities/sellers. |
 | `sellerTaxId` | string | **Opt.** | Seller tax identifier. |
+| `sellerAddress` | string | **Opt.** | Issuing entity postal address. Useful for formal reminders and multi-entity installations. |
 | `bankAccount` | string | **Yes** | Bank account the debtor should pay into (IBAN/NRB). Included in reminders. |
 
 ### 3.6 Custom fields & references
@@ -188,7 +188,7 @@ Embedded per invoice. This is the party Sunbay contacts.
 
 If PDF attachments are enabled:
 
-- **Option A:** Sunbay fetches the PDF from your PDF endpoint (§4.3) - once per invoice on first ingestion, and again after a corrective document. You never ship PDFs proactively.
+- **Option A:** Sunbay fetches the PDF from your PDF endpoint (§4.3) on demand, each time it sends a reminder with the invoice attached. Sunbay does not keep PDF copies, so you never ship PDFs proactively - they are served on request.
 - **Option B:** the PDF is delivered together with the invoice data in the same push (§5.1).
 
 One PDF per invoice. PDF specifics (always available? maximum size? PDFs for corrective documents?) are confirmed during onboarding (§10).
@@ -205,6 +205,7 @@ If provided, `lineItems` is an array where each line carries:
 | `quantity` | decimal | **Yes** | Quantity. |
 | `unit` | string | **Opt.** | Unit of measure, e.g. `pcs`, `hours`. |
 | `unitPriceNet` | decimal | **Yes** | Net unit price. |
+| `discountPercent` | decimal | **Opt.** | Line discount in percent, e.g. `10.0`. The line totals below are already net of this discount - it is informational. |
 | `vatRate` | decimal | **Rec.** | VAT rate in percent, e.g. `23.0`. |
 | `vatAmount` | decimal | **Opt.** | VAT amount for the line. |
 | `amountNet` | decimal | **Rec.** | Net total for the line. |
@@ -216,10 +217,10 @@ The same invoice object is used in both options: it is the item shape returned b
 
 ```json
 {
-  "externalInvoiceId": "ERP-2026-INV-000123",
+  "invoiceId": "ERP-2026-INV-000123",
   "invoiceNumber": "FV/2026/01/0123",
   "documentType": "Invoice",
-  "correctedExternalInvoiceId": null,
+  "correctedInvoiceId": null,
   "issueDate": "2026-01-10",
   "dueDate": "2026-01-24",
   "paymentTermDays": 14,
@@ -243,7 +244,7 @@ The same invoice object is used in both options: it is the item shape returned b
   },
 
   "customer": {
-    "externalCustomerId": "ERP-CUST-10001",
+    "customerId": "ERP-CUST-10001",
     "customerName": "Kowalski Handel Sp. z o.o.",
     "customerTaxId": "7010001234",
     "customerEmail": "ksiegowosc@kowalski.pl",
@@ -304,7 +305,7 @@ This is the contract Sunbay's fetcher will code against. **Host and base path ar
 ### 4.2 List invoices
 
 ```
-GET {baseUrl}/invoices?modifiedSince=2026-01-24T09:30:00Z&pageSize=100
+GET {baseUrl}/invoices?modifiedSince=2026-01-24T09:30:00Z&page=1&pageSize=100
 Authorization: <see §7.2>
 Accept: application/json
 ```
@@ -314,7 +315,7 @@ Query parameters (all optional):
 | Parameter | Type | Semantics |
 |---|---|---|
 | `modifiedSince` | ISO-8601 UTC timestamp | Return only invoices with `lastModifiedAt >= modifiedSince` (**inclusive**). When omitted, return a **full snapshot**: all `Open` / `PartiallyPaid` invoices plus `Paid` / `Cancelled` ones within the agreed history window (§10). |
-| `cursor` | opaque string | Continuation token copied from the previous response's `nextCursor`. |
+| `page` | integer | 1-based page number. Default `1`. |
 | `pageSize` | integer | Maximum items per page. Default `100`; the server may cap it (suggested cap `500`). |
 
 Response `200 OK`, `application/json`:
@@ -322,36 +323,39 @@ Response `200 OK`, `application/json`:
 ```json
 {
   "items": [ { ...invoice objects exactly as defined in §3... } ],
-  "nextCursor": "eyJsYXN0TW9kaWZpZWRBdCI6IjIwMjYtMDEt...",
+  "page": 1,
+  "pageSize": 100,
   "totalCount": 1234
 }
 ```
 
 - `items` - full invoice objects (§3.9 shape), field names 1:1.
-- `nextCursor` - `null` or absent on the last page; otherwise Sunbay passes it back **unchanged** in the next request. **Cursor-based pagination is recommended** - offset/page-number paging drops or duplicates rows when data changes mid-crawl. A non-binding implementation hint: keyset pagination ordered by `(lastModifiedAt, externalInvoiceId)` ascending, with the cursor encoding the last-seen pair. Cursors only need to stay valid for the duration of one crawl (hours).
-- `totalCount` - optional, informational.
-- **Ordering:** ascending by `lastModifiedAt` with a stable tie-break, so an interrupted crawl can resume safely.
+- `page` / `pageSize` - echo the request. Sunbay walks pages until a page returns fewer than `pageSize` items (or `page * pageSize` reaches `totalCount`).
+- `totalCount` - total number of matching invoices. **Recommended** - it lets Sunbay size the crawl; if omitted, Sunbay simply stops when a page returns fewer than `pageSize` items.
+- **Ordering:** return results ordered by `(lastModifiedAt, invoiceId)` ascending. A stable total order keeps paging deterministic within a crawl and lets an interrupted crawl resume.
+- **Why plain page numbers (not opaque cursors):** they are trivial for you to implement (`LIMIT`/`OFFSET`, `Skip`/`Take`). Under heavy concurrent modification, page-number paging can occasionally skip a row whose position shifts between page reads - which is acceptable here: `invoiceId` idempotency (§8) makes any duplicates harmless, and the periodic full-snapshot crawl (§4.5) reconciles anything missed.
 
-**Incremental fetching (watermarking).** After each completed crawl Sunbay stores the highest `lastModifiedAt` seen, and polls next with `modifiedSince = watermark - small overlap` (a few minutes). Any duplicates this causes are harmless - `externalInvoiceId` idempotency (§8) makes re-processing a safe update. Your obligations: every data change bumps `lastModifiedAt`, the filter is inclusive, and timestamps are UTC.
+**Incremental fetching (watermarking).** After each completed crawl Sunbay stores the highest `lastModifiedAt` seen, and polls next with `modifiedSince = watermark - small overlap` (a few minutes). Any duplicates this causes are harmless - `invoiceId` idempotency (§8) makes re-processing a safe update. Your obligations: every data change bumps `lastModifiedAt`, the filter is inclusive, and timestamps are UTC.
 
 ### 4.3 Invoice PDF (optional)
 
 > Implement this endpoint **only if** invoice documents should be attached to reminder emails. If you do not need attachments, skip it - the integration works fully without PDFs.
 
 ```
-GET {baseUrl}/invoices/{externalInvoiceId}/pdf
+GET {baseUrl}/invoices/{invoiceId}/pdf
 ```
 
 - `200 OK` with `Content-Type: application/pdf` and the binary document (`Content-Disposition` filename optional).
 - `404` when the id is unknown or the PDF is not yet available - Sunbay retries later.
-- The path parameter is the URL-encoded `externalInvoiceId`.
-- Sunbay fetches each PDF **once** - on first ingestion, and again after a corrective document - so PDFs are never shipped proactively or repeatedly.
+- The path parameter is the URL-encoded `invoiceId`.
+- Sunbay does **not** store copies of PDFs. It fetches the PDF from this endpoint **on demand, each time it sends a reminder with the invoice attached** - so the same invoice's PDF may be requested repeatedly over the collection lifecycle. You never ship PDFs proactively; they are served on request.
+- The endpoint must therefore stay available for as long as an invoice is being chased, not only at first ingestion.
 - Size guideline: up to ~10 MB per document (confirmed during onboarding).
 
 ### 4.4 Single invoice (optional, recommended)
 
 ```
-GET {baseUrl}/invoices/{externalInvoiceId}
+GET {baseUrl}/invoices/{invoiceId}
 ```
 
 Returns `200 OK` with one invoice object (§3), or `404` if unknown. Used for spot re-fetches and joint debugging; not required for the integration to work.
@@ -373,7 +377,7 @@ Returns `200 OK` with one invoice object (§3), or `404` if unknown. Used for sp
 ### 4.7 Example exchange
 
 ```
-GET /sunbay/v1/invoices?modifiedSince=2026-01-24T09:30:00Z&pageSize=100
+GET /sunbay/v1/invoices?modifiedSince=2026-01-24T09:30:00Z&page=1&pageSize=100
 Authorization: Bearer eyJhbGciOi...
 Accept: application/json
 ```
@@ -383,7 +387,8 @@ Accept: application/json
   "items": [
     { ...the invoice object from §3.9... }
   ],
-  "nextCursor": null,
+  "page": 1,
+  "pageSize": 100,
   "totalCount": 1
 }
 ```
@@ -411,6 +416,8 @@ Use this option when your environment cannot expose an inbound endpoint: connect
 ### 5.1 Per-invoice push (primary)
 
 For each invoice, your system makes **one call** to Sunbay carrying the invoice's structured data (§3). When PDF attachments are enabled (§3.7), the PDF travels **together** with the data in the same call as `multipart/form-data`; without PDFs, the push is a plain JSON request. Invoices are sent one after another on your interval - each call is small, so a standard HTTPS request is sufficient.
+
+> **PDF storage.** In push mode, when attachments are enabled, Sunbay **stores** each pushed PDF on its side - it has no way to fetch it back from your system when a reminder is sent later. This is the opposite of Option A, where PDFs are pulled on demand and never stored. Avoiding PDF storage (and keeping documents authoritative in your system) is one reason Option A is recommended.
 
 `POST /api/ingest/invoices`:
 
@@ -494,7 +501,6 @@ You decide how your endpoint authenticates Sunbay; any of the following works, c
 
 Additionally:
 
-- **IP allowlisting is feasible in this option**: Sunbay calls from a stable, published set of egress IP addresses, which you may allowlist at your perimeter.
 - **Tenant identification is implicit** - the base URL and credentials identify the client on both sides; no `tenantCode` field is used in Option A.
 - Sunbay stores the credentials you issue in a secrets store and supports rotation.
 
@@ -508,8 +514,6 @@ The method is agreed during onboarding and aligned with your security policy:
 
 **Tenant identification:** each call carries a `tenantCode` together with the credential; Sunbay maps the pair to a single tenant. Data is isolated per tenant; a credential can only write data for its own tenant. For a single-client integration the `tenantCode` is a fixed constant provided at onboarding.
 
-If your outbound egress uses static IP addresses, allowlisting on Sunbay's side can additionally be agreed; otherwise authentication relies on the credential.
-
 ### 7.4 Data protection
 
 - Encrypted in transit (TLS) and at rest on the Sunbay side.
@@ -520,12 +524,12 @@ If your outbound egress uses static IP addresses, allowlisting on Sunbay's side 
 
 ## 8. Reliability
 
-**Idempotency (both options).** `externalInvoiceId` is the key: re-sending or re-fetching the same invoice is a safe **update**, never a duplicate. An invoice's `externalInvoiceId` must never change between syncs, edits or retries.
+**Idempotency (both options).** `invoiceId` is the key: re-sending or re-fetching the same invoice is a safe **update**, never a duplicate. An invoice's `invoiceId` must never change between syncs, edits or retries.
 
 **Option A - Sunbay retries**
 
 - Transient failures, timeouts and `5xx` responses are retried with exponential backoff; `429` with `Retry-After` is honoured.
-- Your obligations: stable identifiers, an **inclusive** `modifiedSince` filter, `lastModifiedAt` updated on every data change, cursors valid for the duration of a crawl, and cancellation tombstones (§4.5).
+- Your obligations: stable identifiers, an **inclusive** `modifiedSince` filter, `lastModifiedAt` updated on every data change, a stable ordering by `(lastModifiedAt, invoiceId)` during a crawl, and cancellation tombstones (§4.5).
 - Brief outages are unproblematic - they only delay the next successful poll.
 - Ordering of corrections is handled by Sunbay internally: if a corrective document appears before its original (e.g. across page boundaries), it is accepted and linked once the original arrives.
 
@@ -542,7 +546,7 @@ If your outbound egress uses static IP addresses, allowlisting on Sunbay's side 
 **Option A**
 
 - Sunbay polls incrementally on an agreed schedule - typically every 15-60 minutes - plus an optional periodic full snapshot (e.g. nightly or weekly) for reconciliation.
-- PDF fetches (if enabled) happen once per new or corrected invoice, with bounded concurrency.
+- PDF fetches (if enabled) happen on demand whenever a reminder with an attachment is sent, with bounded concurrency - the same invoice's PDF may be requested more than once over its collection lifecycle.
 - Tell us your **rate limits** and maintenance windows - Sunbay stays within them and honours `429` / `Retry-After`.
 - Please share expected **daily and peak volumes** (e.g. month-end) so page size and poll frequency can be sized sensibly.
 
@@ -573,7 +577,7 @@ If your outbound egress uses static IP addresses, allowlisting on Sunbay's side 
 **Option A**
 
 10. API base URL, credential exchange and rotation procedure; chosen authentication method (§7.2).
-11. Your rate limits and maintenance windows; Sunbay egress IPs for allowlisting.
+11. Your rate limits and maintenance windows.
 12. Initial load depth - how far back paid invoices are exposed (e.g. all open, plus paid within N months).
 13. `lastModifiedAt` semantics - which changes bump it, and with what precision?
 14. Test/sandbox environment availability.
@@ -583,4 +587,4 @@ If your outbound egress uses static IP addresses, allowlisting on Sunbay's side 
 
 16. **Acknowledgment** - do you want to read back per-invoice/per-batch results? If so: response bodies, error/duplicate signalling, and the retry tie-in (§5.5).
 17. Push frequency and backfill mechanics (bulk file vs per-invoice) (§5.2, §9).
-18. Chosen authentication method (§7.3) and its feasibility from your environment; whether your egress IPs are static (optional allowlisting).
+18. Chosen authentication method (§7.3) and its feasibility from your environment.
