@@ -11,6 +11,8 @@ Two integration options are supported:
 
 The **data model (§3) is the core of this document** and is identical for both options. Sections §4 and §5 describe the two exchange mechanisms; §6-§9 cover formats, security, reliability and scheduling. A number of protocol details are deliberately left **open for onboarding (§10)**.
 
+> **On flexibility.** This is the specification to implement, not a loose suggestion. Where a field or detail genuinely cannot be met by your source system, we can align it together during onboarding (§10). Please implement the contract as written and flag the specific points that do not fit.
+
 > **Scope.** This document covers *what data Sunbay needs* and *how it is exchanged*. How Sunbay stores, processes, or acts on the data internally is intentionally out of scope.
 
 ---
@@ -46,11 +48,6 @@ In both integration options the ERP remains the **system of record**. Sunbay nev
 - The exact data fields Sunbay needs per invoice and per customer (§3).
 - The two exchange mechanisms: a client-hosted API that Sunbay polls (§4), or pushes to Sunbay's ingestion endpoints (§5).
 - Data formats (§6), authentication (§7), reliability rules (§8), scheduling and volumes (§9).
-
-**Out of scope**
-
-- What Sunbay does with the data internally and how collection flows are configured.
-- Storage of PDFs and any internal references/URLs Sunbay generates.
 
 ---
 
@@ -350,7 +347,7 @@ GET {baseUrl}/invoices/{invoiceId}/pdf
 - The path parameter is the URL-encoded `invoiceId`.
 - Sunbay does **not** store copies of PDFs. It fetches the PDF from this endpoint **on demand, each time it sends a reminder with the invoice attached** - so the same invoice's PDF may be requested repeatedly over the collection lifecycle. You never ship PDFs proactively; they are served on request.
 - The endpoint must therefore stay available for as long as an invoice is being chased, not only at first ingestion.
-- Size guideline: up to ~10 MB per document (confirmed during onboarding).
+- Size guideline: up to ~5 MB per document (confirmed during onboarding).
 
 ### 4.4 Single invoice (optional, recommended)
 
