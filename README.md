@@ -55,7 +55,7 @@ In both integration options the ERP remains the **system of record**. Sunbay nev
 
 ### 2.1 Option A - client-hosted API, Sunbay pulls (recommended)
 
-You expose a small, **read-only HTTPS API** over the ERP data (specified in §4). Sunbay calls it on a schedule it controls: incremental polls for new and changed invoices, plus optional periodic full snapshots for reconciliation.
+You expose a small, **read-only HTTPS API** over the ERP data (specified in §4). Sunbay calls it on a schedule it controls: incremental polls for new and changed invoices, plus periodic full snapshots for reconciliation.
 
 Why this is the recommended option:
 
@@ -112,15 +112,17 @@ An invoice is a JSON object carrying the invoice-level fields at the **top level
 
 #### 3.1.1 `documentType` values
 
-| Value | Meaning | Collectible receivable? |
+| Value | Meaning | Chased by Sunbay? |
 |---|---|---|
-| `Invoice` | Standard (VAT) invoice | **Yes** |
-| `CorrectiveInvoice` | Corrective / adjustment invoice | When its own `amountOutstanding` is positive (§3.1.2) |
-| `AdvanceInvoice` | Advance payment invoice | Yes (advance) |
+| `Invoice` | Standard (VAT) invoice | Yes |
+| `CorrectiveInvoice` | Corrective / adjustment invoice | Yes |
+| `AdvanceInvoice` | Advance payment invoice | Yes |
 | `FinalInvoice` | Final invoice | Yes |
 | `Proforma` | Pro forma invoice | **No** - not a legal receivable |
 | `CreditNote` | Credit note | **No** - a negative document; its open amount offsets what the debtor owes |
-| `DebitNote` | Debit note | Yes - its own open amount |
+| `DebitNote` | Debit note | Yes |
+
+"Yes" means one thing for every kind: the record is chased **when its own `amountOutstanding` is positive** (§3.1.2). Proformas are excluded regardless of amounts, and a credit note never has a positive open amount.
 
 > If your source system uses other document kinds, list them during onboarding so we can map them (§10).
 
@@ -160,7 +162,7 @@ This is accepted, but it has a visible consequence: the debtor holds one documen
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `status` | enum | **Yes** | `Open` · `PartiallyPaid` · `Paid` · `Cancelled`. |
-| `paidDate` | date | **Cond.** | Date the invoice was fully paid. Required when `status = Paid`. |
+| `paidDate` | date | **Cond.** | Date the document was fully settled. Required when `status = Paid`. On a document closed by netting rather than by payment (a credit note applied to its invoice) it is the date of that settlement. |
 | `isBlockedForCollection` | boolean | **Rec.** | `true` if Sunbay must **not** chase this invoice (dispute, legal hold, internal block). If the source system has no equivalent concept, **omit the field** instead of sending `false` on every record - an omitted field means *no block information is available*, whereas `false` is a positive statement that the invoice may be chased. When the field is absent, Sunbay treats the invoice as chaseable. |
 | `lastModifiedAt` | timestamp | **Yes** (Option A) / **Rec.** (Option B) | When the invoice record last changed in the source system (ISO-8601 UTC). Drives incremental fetching in Option A (§4.2): **any** data change - status, amounts, payments, cancellation, correction linkage - must update this timestamp. |
 
@@ -395,9 +397,9 @@ Returns `200 OK` with one invoice object (§3), or `404` if unknown. Used for sp
 
 ### 4.5 Snapshots, increments, cancellations & corrections
 
-- Regular polls are **incremental** (`modifiedSince`). In addition, Sunbay may periodically run a **full-snapshot** crawl (no `modifiedSince`) to reconcile state - e.g. nightly or weekly (§9).
+- Regular polls are **incremental** (`modifiedSince`). In addition, Sunbay periodically runs a **full-snapshot** crawl (no `modifiedSince`) to reconcile state - e.g. nightly or weekly (§9).
 - **Cancellations must stay visible.** A cancelled or deleted invoice must remain retrievable through the API as a *tombstone*: returned with `status = "Cancelled"` and an updated `lastModifiedAt`. It must **not** silently disappear from results - otherwise Sunbay would keep chasing a debt that no longer exists. If the source system hard-deletes records, the API layer must still expose the tombstone.
-- **The corrected original must stay reachable.** Balances do not depend on it (§3.1.2), but an adjusting document is presented and grouped together with the invoice named in `correctedInvoiceId`, so Sunbay must be able to obtain that record. The original is often years old, long paid, and therefore **outside the agreed history window** (§4.2). Two acceptable routes, chosen at onboarding (§10): **(a)** the API layer keeps referenced originals in scope - a document referenced by `correctedInvoiceId` from any record in scope is itself part of the full snapshot regardless of its age or status, and issuing an adjusting document bumps the original's `lastModifiedAt` (it is a data change, §3.3) so it re-enters the next incremental poll; or **(b)** implement the single-invoice endpoint (§4.4), which Sunbay calls to fetch any original it has not seen - in this variant §4.4 is **not optional**.
+- **The corrected original must stay reachable.** Balances do not depend on it (§3.1.2), but an adjusting document is presented and grouped together with the invoice named in `correctedInvoiceId`, so Sunbay must be able to obtain that record. The original is often years old, long paid, and therefore **outside the agreed history window** (§4.2). Two acceptable routes, chosen at onboarding (§10): **(a)** the API layer keeps referenced originals in scope - a document referenced by `correctedInvoiceId` from any record in scope is itself part of the full snapshot regardless of its age or status, and issuing an adjusting document bumps the original's `lastModifiedAt` so it re-enters the next incremental poll - §3.3 already counts correction linkage as a data change, and the API layer owes this bump even when the source system leaves the original record itself untouched; or **(b)** implement the single-invoice endpoint (§4.4), which Sunbay calls to fetch any original it has not seen - in this variant §4.4 is **not optional**.
 - Safety net: during full-snapshot reconciliation, open invoices missing from the snapshot are flagged and handled per the onboarding agreement (§10).
 
 ### 4.6 Errors & availability
@@ -483,7 +485,7 @@ Sunbay responds with an HTTP status indicating receipt (`2xx` accepted, `4xx` fo
 
 ### 5.2 Bulk data-only (backfill)
 
-`POST /api/ingest/bulk` - a single compressed file (`.zip` of CSV or JSON Lines), **data only, no PDFs** - for initial historical backfill or very high volumes. The same logical fields from §3 apply, one record per invoice. This is an alternative to issuing thousands of individual calls for a first load.
+`POST /api/ingest/bulk` - a single compressed file (`.zip` of JSON Lines or CSV), **data only, no PDFs** - for initial historical backfill or very high volumes. One record per invoice, the same fields as §3. **JSON Lines** carries the invoice object from §3.9 unchanged, one per line - prefer it. **CSV** needs the nested objects flattened: name columns by dot-path (`customer.name`, `seller.bankAccount`), leave `lineItems` out (or JSON-encode them in a single column), and JSON-encode each `customFields` object in its own column. This is an alternative to issuing thousands of individual calls for a first load.
 
 ### 5.3 Sync modes
 
@@ -492,7 +494,7 @@ Which invoices to send each cycle is chosen during onboarding:
 - **Full snapshot** - each cycle, send **all currently-open invoices** (plus recently-paid ones, so settlements are reflected). Simple and self-healing - corrections, cancellations and payments are naturally picked up because the complete current picture is resent.
 - **Incremental** - each cycle, send **only invoices created or changed since the previous successful sync** (including those whose status changed to paid). Lighter, but **deletions/cancellations in the source system will not appear as a "change"** - so an **explicit cancellation signal** is required (`status = Cancelled`, or a dedicated cancel call), otherwise Sunbay would keep chasing a debt that no longer exists.
 
-**Corrected originals.** Sunbay cannot fetch anything in this option, so the delivery job carries the responsibility: whenever it pushes an adjusting document (§3.1.2), the invoice named in `correctedInvoiceId` must have been pushed too. The original is often old and long paid, so in incremental mode it will not show up as a change - push it alongside the correction (re-pushing it is a safe update, §8), or confirm at onboarding that the history window already covers it (§10).
+**Corrected originals.** Sunbay cannot fetch anything in this option, so the delivery job carries the responsibility: whenever it pushes an adjusting document (§3.1.2), the invoice named in `correctedInvoiceId` must have been pushed too. The original is often old and long paid. Whether it shows up as a change in incremental mode depends on your system (§3.1.2): if the adjustment is netted against it, its open amount changes and it is picked up; if the two stay separate open items, it may not change at all. Do not rely on that - push the original alongside the adjusting document (re-pushing it is a safe update, §8), or confirm at onboarding that the history window already covers it (§10).
 
 ### 5.4 Optional "sync session" framing
 
@@ -583,7 +585,7 @@ The method is agreed during onboarding and aligned with your security policy:
 
 **Option A**
 
-- Sunbay polls incrementally on an agreed schedule - typically every 15-60 minutes - plus an optional periodic full snapshot (e.g. nightly or weekly) for reconciliation.
+- Sunbay polls incrementally on an agreed schedule - typically every 15-60 minutes - plus a periodic full snapshot (e.g. nightly or weekly) for reconciliation.
 - PDF fetches (if enabled) happen on demand whenever a reminder with an attachment is sent, with bounded concurrency - the same invoice's PDF may be requested more than once over its collection lifecycle.
 - Tell us your **rate limits** and maintenance windows - Sunbay stays within them and honours `429` / `Retry-After`.
 - Please share expected **daily and peak volumes** (e.g. month-end) so page size and poll frequency can be sized sensibly.
