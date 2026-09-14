@@ -92,7 +92,9 @@ Your system pushes each invoice to Sunbay's ingestion endpoints (§5), one call 
 
 ## 3. Data Model
 
-This is the **most important section**. Each invoice exposed to (or pushed to) Sunbay should carry the following fields. Customer (debtor) data is **embedded with each invoice** (denormalized) - there is no separate customer feed.
+This is the **most important section**. Each invoice exposed to (or pushed to) Sunbay should carry the following fields.
+
+An invoice is a JSON object carrying the invoice-level fields at the **top level** plus two **nested objects**: `customer` (§3.4) and `seller` (§3.5). Debtor data is embedded with each invoice (denormalized) - there is no separate customer feed. Field names inside the nested objects are **unprefixed** (`customer.name`, `seller.name`); the complete shape is shown in §3.9.
 
 **Required** column legend: **Yes** = mandatory · **Rec.** = recommended (strongly preferred) · **Opt.** = optional · **Cond.** = conditional.
 
@@ -101,9 +103,9 @@ This is the **most important section**. Each invoice exposed to (or pushed to) S
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `invoiceId` | string | **Yes** | Stable, globally-unique identifier of the invoice **in the source system**. Used to recognise the same invoice across syncs (deduplication / update key). Must be **stable** - the same invoice must always carry the same id, even after edits. |
-| `invoiceNumber` | string | **Yes** | Human-readable invoice number (e.g. `FV/2026/01/0123`). Shown to the debtor in reminders. |
+| `invoiceNumber` | string | **Yes** | Human-readable invoice number (e.g. `FV/2026/01/0123`). Shown to the debtor in reminders. **Not required to be unique** - see §3.1.3. |
 | `documentType` | enum | **Yes** | Kind of document - see §3.1.1. |
-| `correctedInvoiceId` | string | **Cond.** | When `documentType = CorrectiveInvoice`: the `invoiceId` of the original invoice this document corrects. |
+| `correctedInvoiceId` | string | **Cond.** | Required on every adjusting document (`CorrectiveInvoice`, `CreditNote`, `DebitNote`): the `invoiceId` of the original invoice it relates to. |
 | `issueDate` | date | **Yes** | Date the invoice was issued. |
 | `dueDate` | date | **Yes** | Payment due date - when the invoice becomes collectible. |
 | `paymentTermDays` | integer | **Opt.** | Payment term in days, if available. |
@@ -113,18 +115,30 @@ This is the **most important section**. Each invoice exposed to (or pushed to) S
 | Value | Meaning | Collectible receivable? |
 |---|---|---|
 | `Invoice` | Standard (VAT) invoice | **Yes** |
-| `CorrectiveInvoice` | Corrective / adjustment invoice | Adjusts an existing receivable |
+| `CorrectiveInvoice` | Corrective / adjustment invoice | When its own `amountOutstanding` is positive (§3.1.2) |
 | `AdvanceInvoice` | Advance payment invoice | Yes (advance) |
 | `FinalInvoice` | Final invoice | Yes |
 | `Proforma` | Pro forma invoice | **No** - not a legal receivable |
-| `CreditNote` | Credit note | Reduces a receivable |
-| `DebitNote` | Debit note | Increases a receivable |
+| `CreditNote` | Credit note | **No** - a negative document; its open amount offsets what the debtor owes |
+| `DebitNote` | Debit note | Yes - its own open amount |
 
 > If your source system uses other document kinds, list them during onboarding so we can map them (§10).
 
 #### 3.1.2 Corrections
 
-A corrective document carries `documentType = CorrectiveInvoice` and `correctedInvoiceId` pointing at the original invoice. It adjusts the outstanding amount of the original receivable. **How your source system expresses correction amounts** (the new corrected totals, the difference/delta, or "before/after") must be confirmed during onboarding so the balance is interpreted correctly (§10).
+Adjusting documents (`CorrectiveInvoice`, `CreditNote`, `DebitNote`) are delivered as **separate invoice records**, each with its own `invoiceId`, and point at the document they adjust through `correctedInvoiceId`. The original record is never rewritten with corrected values.
+
+**Every record is its own open item.** `amountOutstanding` on each record - original or adjusting - is **the open amount of that document as your source system sees it right now**. Sunbay chases every record whose `amountOutstanding` is positive and never recomputes balances from correction chains. That is what makes the feed safe against double counting: if your system nets a credit note against the original, the original's `amountOutstanding` drops and the credit note's goes to `0`; if it keeps them as two open items, the original stays as issued and the credit note carries a negative open amount. Both are correct - the sum is the same, and Sunbay reads whichever state you expose.
+
+**Amounts on adjusting documents are the document's own amounts, signed.** `amountNet` / `amountVat` / `amountGross` carry the **difference** the document introduces, with its sign: **negative** reduces what the debtor owes, **positive** increases it. If your source system stores a correction as new corrected totals or as "before/after", the integration layer derives the signed difference. Do not send absolute values with the direction implied by the document type or by the accounting side of the entry - a `CorrectiveInvoice` goes both ways, so an unsigned amount is not interpretable.
+
+`correctedInvoiceId` is what links the two records: it lets a reminder quote the original invoice number next to the correction, and it groups them for analytics. The referenced original must also reach Sunbay - see §4.5 (Option A) and §5.3 (Option B). How your source system expresses correction amounts is confirmed during onboarding (§10).
+
+#### 3.1.3 `invoiceNumber` is not a unique key
+
+Only `invoiceId` is unique. One accounting document may reach Sunbay as **several invoice records sharing the same `invoiceNumber`** - for example when the source system keys documents by line or item position, each line carrying its own `invoiceId`, its own amounts and sometimes its own due date.
+
+This is accepted, but it has a visible consequence: the debtor holds one document bearing one number, while Sunbay may be chasing several receivables that all carry it. Tell us at onboarding whether your data works this way (§10), so reminder content and payment matching are set up accordingly.
 
 ### 3.2 Amounts & currency
 
@@ -133,9 +147,13 @@ A corrective document carries `documentType = CorrectiveInvoice` and `correctedI
 | `currency` | string (ISO 4217) | **Yes** | e.g. `PLN`, `EUR`. |
 | `amountNet` | decimal | **Yes** | Net amount. |
 | `amountVat` | decimal | **Yes** | VAT amount. |
-| `amountGross` | decimal | **Yes** | Gross total - the full amount of the receivable. |
-| `amountPaid` | decimal | **Yes** | Amount already paid against this invoice (`0` if none). Enables partial-payment handling. |
-| `amountOutstanding` | decimal | **Yes** | Remaining balance still owed (`amountGross - amountPaid`). This is what collection chases. |
+| `amountGross` | decimal | **Yes** | Gross total of this document. Signed on adjusting documents (§3.1.2). |
+| `amountPaid` | decimal | **Yes** | Amount settled against this document by payments (`0` if none). Enables partial-payment handling. **Never clamped** to `amountGross` - see overpayments below. |
+| `amountOutstanding` | decimal | **Yes** | **The open amount of this document in your source system, right now.** This is the authoritative value and what collection chases. It is normally `amountGross - amountPaid`, but not always: adjusting documents netted against this one change it without touching `amountPaid` (§3.1.2), and cancelled documents report `0` (§3.3). |
+
+**Signs.** `amountNet` / `amountVat` / `amountGross` are non-negative on ordinary documents and signed on adjusting documents (§3.1.2). `amountOutstanding` may be **negative on any document** - an overpaid invoice, or a credit note that has not been netted yet. Sunbay chases **only positive** `amountOutstanding`.
+
+**Overpayments.** When more is received than was invoiced, do **not** clamp. `amountPaid` carries the full amount actually received, and `amountOutstanding` goes **negative** by the surplus; `status` is `Paid`. Capping `amountPaid` at `amountGross` silently deletes the surplus from the feed and is not acceptable - the overpayment is real information about the debtor's account.
 
 ### 3.3 Status & lifecycle
 
@@ -143,40 +161,55 @@ A corrective document carries `documentType = CorrectiveInvoice` and `correctedI
 |---|---|---|---|
 | `status` | enum | **Yes** | `Open` · `PartiallyPaid` · `Paid` · `Cancelled`. |
 | `paidDate` | date | **Cond.** | Date the invoice was fully paid. Required when `status = Paid`. |
-| `isBlockedForCollection` | boolean | **Yes** | `true` if Sunbay must **not** chase this invoice (dispute, legal hold, internal block). |
+| `isBlockedForCollection` | boolean | **Rec.** | `true` if Sunbay must **not** chase this invoice (dispute, legal hold, internal block). If the source system has no equivalent concept, **omit the field** instead of sending `false` on every record - an omitted field means *no block information is available*, whereas `false` is a positive statement that the invoice may be chased. When the field is absent, Sunbay treats the invoice as chaseable. |
 | `lastModifiedAt` | timestamp | **Yes** (Option A) / **Rec.** (Option B) | When the invoice record last changed in the source system (ISO-8601 UTC). Drives incremental fetching in Option A (§4.2): **any** data change - status, amounts, payments, cancellation, correction linkage - must update this timestamp. |
+
+**Status must follow from the amounts.** The two must never contradict each other. The rules below hold for every document kind; on documents with negative amounts (credit notes) compare absolute values.
+
+| Condition | `status` |
+|---|---|
+| Nothing settled yet: `amountPaid = 0` and `amountOutstanding ≠ 0` | `Open` |
+| Partly settled: `amountPaid ≠ 0` and `amountOutstanding ≠ 0`, not overpaid | `PartiallyPaid` |
+| Nothing open: `amountOutstanding = 0`, or overpaid (`\|amountPaid\| > \|amountGross\|`) | `Paid` (with `paidDate` set) |
+| Document cancelled or voided in the source system | `Cancelled`, whatever the amounts |
+
+If a record nevertheless arrives self-contradictory - `PartiallyPaid` with `amountOutstanding = 0`, say - **the amounts decide** what Sunbay does: only a positive `amountOutstanding` is chased. Two overrides always win regardless of the amounts: `Cancelled` and `isBlockedForCollection = true` both stop collection.
+
+**Cancelled documents.** A cancelled invoice keeps its nominal `amountGross` (the document itself is not rewritten), reports **`amountOutstanding = 0`** and `paidDate = null`, and keeps `amountPaid` truthful - usually `0`, but if a payment was booked against the document before it was voided, that payment stays visible (it is now your system's refund to handle). This is the one case where `amountOutstanding` is forced rather than observed: nothing is collectible on a cancelled document. The record must still reach Sunbay - as a tombstone in Option A (§4.5), or through the explicit cancellation signal in Option B (§5.3).
 
 ### 3.4 Debtor (customer)
 
-Embedded per invoice. This is the party Sunbay contacts.
+Delivered as a **nested `customer` object** on every invoice. This is the party Sunbay contacts, so the object itself is required.
 
-| Field | Type | Required | Description |
+| Field (inside `customer`) | Type | Required | Description |
 |---|---|---|---|
-| `customerId` | string | **Yes** | Stable, unique identifier of the customer in the source system. |
-| `customerName` | string | **Yes** | Debtor name (company or person). |
-| `customerTaxId` | string | **Rec.** | Tax identifier (e.g. VAT ID / NIP). |
-| `customerEmail` | string | **Rec.** | Primary email. Required for email reminders. |
-| `customerEmailCcs` | string[] | **Opt.** | **List** of additional CC email addresses. |
-| `customerPhone` | string | **Opt.** | Phone number in **international format including the country code**, e.g. `+48512345678`. Required for SMS reminders. |
-| `customerAddress` | string | **Rec.** | Postal address. |
-| `customerCountryCode` | string (ISO 3166-1) | **Yes** | e.g. `PL`. |
-| `customerCommunicationLanguage` | string (ISO 639-1) | **Opt.** | Preferred language for reminders, e.g. `pl`, `en`, `de`. Sunbay selects the reminder template language per debtor; when absent, the client-wide default is used. |
+| `id` | string | **Yes** | Stable, unique identifier of the customer in the source system. |
+| `name` | string | **Yes** | Debtor name (company or person). |
+| `taxId` | string | **Rec.** | Tax identifier (e.g. VAT ID / NIP). One consistent format across the whole feed (§6). |
+| `email` | string | **Rec.** | Primary email. Required for email reminders. |
+| `emailCcs` | string[] | **Opt.** | **List** of additional CC email addresses. |
+| `phone` | string | **Opt.** | Phone number in **international format including the country code**, e.g. `+48512345678`. Required for SMS reminders. |
+| `address` | string | **Rec.** | Postal address. |
+| `countryCode` | string (ISO 3166-1) | **Yes** | e.g. `PL`. |
+| `communicationLanguage` | string (ISO 639-1) | **Opt.** | Preferred language for reminders, e.g. `pl`, `en`, `de`. Sunbay selects the reminder template language per debtor; when absent, the client-wide default is used. |
 | `customFields` | object | **Opt.** | Arbitrary key-value pairs at **customer** level (see §3.6). |
 
 ### 3.5 Seller & payment
 
-| Field | Type | Required | Description |
+Delivered as a **nested `seller` object** on every invoice. The object is required, because `bankAccount` is.
+
+| Field (inside `seller`) | Type | Required | Description |
 |---|---|---|---|
-| `sellerName` | string | **Opt.** | Issuing entity name. A single installation may contain several legal entities/sellers. |
-| `sellerTaxId` | string | **Opt.** | Seller tax identifier. |
-| `sellerAddress` | string | **Opt.** | Issuing entity postal address. Useful for formal reminders and multi-entity installations. |
+| `name` | string | **Opt.** | Issuing entity name. A single installation may contain several legal entities/sellers. |
+| `taxId` | string | **Opt.** | Seller tax identifier. |
+| `address` | string | **Opt.** | Issuing entity postal address. Useful for formal reminders and multi-entity installations. |
 | `bankAccount` | string | **Yes** | Bank account the debtor should pay into (IBAN/NRB). Included in reminders. |
 
 ### 3.6 Custom fields & references
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `customFields` | object | **Opt.** | Arbitrary key-value pairs at **invoice** level. **Custom fields are supported at both invoice and customer level** - send any extra attributes that may be useful (segment, region, contract code, cost centre, ...). |
+| `customFields` | object | **Opt.** | Arbitrary key-value pairs at **invoice (top) level**. **Custom fields are supported at both invoice and customer level** - send any extra attributes that may be useful (segment, region, contract code, cost centre, ...). |
 | `externalReference` | string | **Opt.** | Any additional reference useful for reconciliation. |
 
 ### 3.7 PDF (optional)
@@ -235,21 +268,22 @@ The same invoice object is used in both options: it is the item shape returned b
   "lastModifiedAt": "2026-01-25T11:02:14Z",
 
   "seller": {
-    "sellerName": "ACME Sp. z o.o.",
-    "sellerTaxId": "5213001234",
+    "name": "ACME Sp. z o.o.",
+    "taxId": "5213001234",
+    "address": "ul. Handlowa 5, 00-002 Warszawa",
     "bankAccount": "PL61109010140000071219812874"
   },
 
   "customer": {
-    "customerId": "ERP-CUST-10001",
-    "customerName": "Kowalski Handel Sp. z o.o.",
-    "customerTaxId": "7010001234",
-    "customerEmail": "ksiegowosc@kowalski.pl",
-    "customerEmailCcs": ["zarzad@kowalski.pl", "biuro@kowalski.pl"],
-    "customerPhone": "+48512345678",
-    "customerAddress": "ul. Przykładowa 12, 00-001 Warszawa",
-    "customerCountryCode": "PL",
-    "customerCommunicationLanguage": "pl",
+    "id": "ERP-CUST-10001",
+    "name": "Kowalski Handel Sp. z o.o.",
+    "taxId": "7010001234",
+    "email": "ksiegowosc@kowalski.pl",
+    "emailCcs": ["zarzad@kowalski.pl", "biuro@kowalski.pl"],
+    "phone": "+48512345678",
+    "address": "ul. Przykładowa 12, 00-001 Warszawa",
+    "countryCode": "PL",
+    "communicationLanguage": "pl",
     "customFields": {
       "segment": "B2B",
       "region": "Mazowieckie"
@@ -349,18 +383,21 @@ GET {baseUrl}/invoices/{invoiceId}/pdf
 - The endpoint must therefore stay available for as long as an invoice is being chased, not only at first ingestion.
 - Size guideline: up to ~5 MB per document (confirmed during onboarding).
 
-### 4.4 Single invoice (optional, recommended)
+### 4.4 Single invoice (recommended)
 
 ```
 GET {baseUrl}/invoices/{invoiceId}
 ```
 
-Returns `200 OK` with one invoice object (§3), or `404` if unknown. Used for spot re-fetches and joint debugging; not required for the integration to work.
+Returns `200 OK` with one invoice object (§3), or `404` if unknown. Used for spot re-fetches and joint debugging.
 
-### 4.5 Snapshots, increments & cancellations
+> Optional in general - **except** when it is the route chosen for reaching corrected originals (§4.5, route **b**). In that case this endpoint is mandatory.
+
+### 4.5 Snapshots, increments, cancellations & corrections
 
 - Regular polls are **incremental** (`modifiedSince`). In addition, Sunbay may periodically run a **full-snapshot** crawl (no `modifiedSince`) to reconcile state - e.g. nightly or weekly (§9).
 - **Cancellations must stay visible.** A cancelled or deleted invoice must remain retrievable through the API as a *tombstone*: returned with `status = "Cancelled"` and an updated `lastModifiedAt`. It must **not** silently disappear from results - otherwise Sunbay would keep chasing a debt that no longer exists. If the source system hard-deletes records, the API layer must still expose the tombstone.
+- **The corrected original must stay reachable.** Balances do not depend on it (§3.1.2), but an adjusting document is presented and grouped together with the invoice named in `correctedInvoiceId`, so Sunbay must be able to obtain that record. The original is often years old, long paid, and therefore **outside the agreed history window** (§4.2). Two acceptable routes, chosen at onboarding (§10): **(a)** the API layer keeps referenced originals in scope - a document referenced by `correctedInvoiceId` from any record in scope is itself part of the full snapshot regardless of its age or status, and issuing an adjusting document bumps the original's `lastModifiedAt` (it is a data change, §3.3) so it re-enters the next incremental poll; or **(b)** implement the single-invoice endpoint (§4.4), which Sunbay calls to fetch any original it has not seen - in this variant §4.4 is **not optional**.
 - Safety net: during full-snapshot reconciliation, open invoices missing from the snapshot are flagged and handled per the onboarding agreement (§10).
 
 ### 4.6 Errors & availability
@@ -455,6 +492,8 @@ Which invoices to send each cycle is chosen during onboarding:
 - **Full snapshot** - each cycle, send **all currently-open invoices** (plus recently-paid ones, so settlements are reflected). Simple and self-healing - corrections, cancellations and payments are naturally picked up because the complete current picture is resent.
 - **Incremental** - each cycle, send **only invoices created or changed since the previous successful sync** (including those whose status changed to paid). Lighter, but **deletions/cancellations in the source system will not appear as a "change"** - so an **explicit cancellation signal** is required (`status = Cancelled`, or a dedicated cancel call), otherwise Sunbay would keep chasing a debt that no longer exists.
 
+**Corrected originals.** Sunbay cannot fetch anything in this option, so the delivery job carries the responsibility: whenever it pushes an adjusting document (§3.1.2), the invoice named in `correctedInvoiceId` must have been pushed too. The original is often old and long paid, so in incremental mode it will not show up as a change - push it alongside the correction (re-pushing it is a safe update, §8), or confirm at onboarding that the history window already covers it (§10).
+
 ### 5.4 Optional "sync session" framing
 
 To bound a full snapshot and give a natural place to report results, calls in one cycle may be grouped in a session: a **begin** call returns a `sessionId`, per-invoice calls reference it, and a **complete** call closes the cycle. This is optional and subject to the same "to be agreed" note above.
@@ -478,6 +517,8 @@ These conventions apply to **both options** - to your API responses in Option A,
 | **Currency** | ISO 4217 three-letter code. |
 | **Phone** | International format with country code, e.g. `+48512345678`. |
 | **Booleans** | `true` / `false`. |
+| **Whitespace** | **Trim** leading and trailing whitespace from every text value. ⚠️ Watch for **non-breaking spaces (U+00A0)** inside customer names, addresses and bank accounts - they survive a naive trim and break matching and display; replace them with ordinary spaces. |
+| **Tax identifiers** | One **consistent** format across the whole feed: either always with the country prefix (`PL5213001234`) or always without (`5213001234`). No spaces, dashes or dots. |
 | **Missing values** | Omit the field or send `null` - do not send empty placeholder strings for numeric/date fields. |
 
 ---
@@ -526,9 +567,9 @@ The method is agreed during onboarding and aligned with your security policy:
 **Option A - Sunbay retries**
 
 - Transient failures, timeouts and `5xx` responses are retried with exponential backoff; `429` with `Retry-After` is honoured.
-- Your obligations: stable identifiers, an **inclusive** `modifiedSince` filter, `lastModifiedAt` updated on every data change, a stable ordering by `(lastModifiedAt, invoiceId)` during a crawl, and cancellation tombstones (§4.5).
+- Your obligations: stable identifiers (`invoiceId`, `customer.id`), an **inclusive** `modifiedSince` filter, `lastModifiedAt` updated on every data change, a stable ordering by `(lastModifiedAt, invoiceId)` during a crawl, and cancellation tombstones (§4.5).
 - Brief outages are unproblematic - they only delay the next successful poll.
-- Ordering of corrections is handled by Sunbay internally: if a corrective document appears before its original (e.g. across page boundaries), it is accepted and linked once the original arrives.
+- Ordering of adjusting documents is handled by Sunbay internally: if a correction appears before its original (e.g. across page boundaries), it is accepted and linked once the original arrives.
 
 **Option B - your delivery job retries**
 
@@ -561,27 +602,34 @@ The method is agreed during onboarding and aligned with your security policy:
 
 **Common (both options)**
 
-1. **Stable identifiers** - does the source system expose a stable, unique id per **invoice** and per **customer** that survives edits? What are they?
-2. **Corrections** - how does the source system represent corrective documents, and are their amounts the **new corrected totals**, the **delta**, or "before/after"? (§3.1.2)
-3. **Partial payments** - can `amountPaid` / `amountOutstanding` be provided, or only a binary paid flag?
-4. **Document types** - which document kinds exist and which are collectible; mapping of any kinds not listed in §3.1.1. Should proformas be excluded?
-5. **Multi-company** - can one installation hold several legal entities/sellers? If so, how is the seller disambiguated?
-6. **Currencies** - are multi-currency invoices expected?
-7. **Volumes** - expected daily and peak invoice counts.
-8. **Formats** - confirm UTF-8, dot decimals, ISO-8601 (including time-zone handling for dates), and phone numbers with country code can be guaranteed (§6).
-9. **PDF attachments - yes or no?** Should Sunbay attach invoice documents to reminder emails? Only if yes: PDF availability, maximum size, and PDFs for corrective documents (§3.7).
+1. **Stable identifiers** - does the source system expose a stable, unique id per **invoice** (`invoiceId`) and per **customer** (`customer.id`) that survives edits? What are they?
+2. **Corrections - storage** - how does the source system store adjusting documents: as separate documents with their own open amount, or as edits of the original? Does it net them against the original, or keep both as open items? (§3.1.2)
+3. **Corrections - sign** - can the signed difference be derived reliably? Does the sign in your system follow the accounting side of the entry, and can the same document kind carry both directions? (§3.1.2)
+4. **Split documents** - is one accounting document ever delivered as several receivables sharing an `invoiceNumber` (e.g. keyed per line item)? (§3.1.3)
+5. **Partial payments** - can `amountPaid` / `amountOutstanding` be provided, or only a binary paid flag?
+6. **Overpayments** - can a payment exceed the invoiced amount, and will the surplus be reported rather than clamped? (§3.2)
+7. **Cancelled documents** - can the source system produce the agreed shape (nominal `amountGross`, `amountOutstanding = 0`, truthful `amountPaid`)? (§3.3)
+8. **Blocking** - does the source system mark invoices that must not be chased (dispute, legal hold)? If not, how should such cases reach Sunbay - or is the field simply omitted? (§3.3)
+9. **Document types** - which document kinds exist and which are collectible; mapping of any kinds not listed in §3.1.1. Should proformas be excluded?
+10. **Multi-company** - can one installation hold several legal entities/sellers? If so, how is the seller disambiguated?
+11. **Currencies** - are multi-currency invoices expected?
+12. **Volumes** - expected daily and peak invoice counts.
+13. **Formats** - confirm UTF-8, dot decimals, ISO-8601 (including time-zone handling for dates), phone numbers with country code, trimmed text free of non-breaking spaces, and one consistent tax-identifier format (§6).
+14. **PDF attachments - yes or no?** Should Sunbay attach invoice documents to reminder emails? Only if yes: PDF availability, maximum size, and PDFs for corrective documents (§3.7).
 
 **Option A**
 
-10. API base URL, credential exchange and rotation procedure; chosen authentication method (§7.2).
-11. Your rate limits and maintenance windows.
-12. Initial load depth - how far back paid invoices are exposed (e.g. all open, plus paid within N months).
-13. `lastModifiedAt` semantics - which changes bump it, and with what precision?
-14. Test/sandbox environment availability.
-15. Poll schedule - incremental interval and full-snapshot cadence (§9).
+15. **Corrected originals** - which route from §4.5 applies: referenced originals kept in scope by the API layer, or the single-invoice endpoint (§4.4)?
+16. API base URL, credential exchange and rotation procedure; chosen authentication method (§7.2).
+17. Your rate limits and maintenance windows.
+18. Initial load depth - how far back paid invoices are exposed (e.g. all open, plus paid within N months).
+19. `lastModifiedAt` semantics - which changes bump it, and with what precision?
+20. Test/sandbox environment availability.
+21. Poll schedule - incremental interval and full-snapshot cadence (§9).
 
 **Option B**
 
-16. **Acknowledgment** - do you want to read back per-invoice/per-batch results? If so: response bodies, error/duplicate signalling, and the retry tie-in (§5.5).
-17. Push frequency and backfill mechanics (bulk file vs per-invoice) (§5.2, §9).
-18. Chosen authentication method (§7.3) and its feasibility from your environment.
+22. **Corrected originals** - can the delivery job push the invoice referenced by `correctedInvoiceId` alongside the adjusting document, even when the original falls outside the sync window (§5.3)?
+23. **Acknowledgment** - do you want to read back per-invoice/per-batch results? If so: response bodies, error/duplicate signalling, and the retry tie-in (§5.5).
+24. Push frequency and backfill mechanics (bulk file vs per-invoice) (§5.2, §9).
+25. Chosen authentication method (§7.3) and its feasibility from your environment.
