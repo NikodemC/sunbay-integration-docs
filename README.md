@@ -59,7 +59,7 @@ You expose a small, **read-only HTTPS API** over the ERP data (specified in §4)
 
 Why this is the recommended option:
 
-- You implement **one read-only endpoint** (plus an optional PDF endpoint) - no scheduler, no retry logic, no outbound delivery pipeline on your side.
+- You implement **a read-only endpoint or two** (an invoice endpoint, plus a PDF endpoint and a single-invoice endpoint where §4.3 and §4.5 call for them) - no scheduler, no retry logic, no outbound delivery pipeline on your side.
 - Sunbay owns scheduling, backfill, retries and pacing - and can adapt them without any change on your side.
 - Cancellations and corrections propagate naturally: Sunbay simply observes the current state of your data.
 - Documents stay authoritative in your system: PDFs are fetched on demand and never stored by Sunbay (unlike push, where Sunbay must keep a copy).
@@ -73,7 +73,7 @@ Your system pushes each invoice to Sunbay's ingestion endpoints (§5), one call 
 | Aspect | Option A - Sunbay pulls | Option B - you push |
 |---|---|---|
 | Who initiates | Sunbay (scheduled polls) | Your system (own scheduler) |
-| You implement | Read-only invoice endpoint (+ optional PDF endpoint) | A delivery job: per-invoice pushes, retries, backoff |
+| You implement | Read-only invoice endpoint (+ PDF and single-invoice endpoints where §4.3 and §4.5 apply) | A delivery job: per-invoice pushes, retries, backoff |
 | Scheduling & retries | Owned by Sunbay | Owned by you |
 | Cancellations | Visible as `Cancelled` tombstones in API responses (§4.5) | Require an explicit cancellation signal in incremental mode (§5.3) |
 | Backfill / first load | Sunbay crawls the history via the same API | Bulk file upload or many individual pushes (§5.2) |
@@ -105,9 +105,9 @@ An invoice is a JSON object carrying the invoice-level fields at the **top level
 | `invoiceId` | string | **Yes** | Stable, globally-unique identifier of the invoice **in the source system**. Used to recognise the same invoice across syncs (deduplication / update key). Must be **stable** - the same invoice must always carry the same id, even after edits. |
 | `invoiceNumber` | string | **Yes** | Human-readable invoice number (e.g. `FV/2026/01/0123`). Shown to the debtor in reminders. **Not required to be unique** - see §3.1.3. |
 | `documentType` | enum | **Yes** | Kind of document - see §3.1.1. |
-| `correctedInvoiceId` | string | **Cond.** | Required on every adjusting document (`CorrectiveInvoice`, `CreditNote`, `DebitNote`): the `invoiceId` of the original invoice it relates to. |
+| `correctedInvoiceId` | string | **Cond.** | On an adjusting document (`CorrectiveInvoice`, `CreditNote`, `DebitNote`) that adjusts a specific invoice: the `invoiceId` of that invoice. A standalone note that adjusts nothing - late-payment interest, a penalty charge - carries no `correctedInvoiceId` and stands as a receivable of its own. Always point at the original invoice, never at an earlier correction of it. |
 | `issueDate` | date | **Yes** | Date the invoice was issued. |
-| `dueDate` | date | **Yes** | Payment due date - when the invoice becomes collectible. |
+| `dueDate` | date | **Cond.** | Payment due date - when the invoice becomes collectible. Required on every document that can be chased; `null` is accepted on a `CreditNote`, which never is. |
 | `paymentTermDays` | integer | **Opt.** | Payment term in days, if available. |
 
 #### 3.1.1 `documentType` values
@@ -128,13 +128,15 @@ An invoice is a JSON object carrying the invoice-level fields at the **top level
 
 #### 3.1.2 Corrections
 
-Adjusting documents (`CorrectiveInvoice`, `CreditNote`, `DebitNote`) are delivered as **separate invoice records**, each with its own `invoiceId`, and point at the document they adjust through `correctedInvoiceId`. The original record is never rewritten with corrected values.
+Adjusting documents (`CorrectiveInvoice`, `CreditNote`, `DebitNote`) are delivered as **separate invoice records**, each with its own `invoiceId`, and - where they adjust a specific invoice - point at it through `correctedInvoiceId`. The original record is never rewritten with corrected values.
 
-**Every record is its own open item.** `amountOutstanding` on each record - original or adjusting - is **the open amount of that document as your source system sees it right now**. Sunbay chases every record whose `amountOutstanding` is positive and never recomputes balances from correction chains. That is what makes the feed safe against double counting: if your system nets a credit note against the original, the original's `amountOutstanding` drops and the credit note's goes to `0`; if it keeps them as two open items, the original stays as issued and the credit note carries a negative open amount. Both are correct - the sum is the same, and Sunbay reads whichever state you expose.
+**Every record is its own open item.** `amountOutstanding` on each record - original or adjusting - is **the open amount of that document as your source system sees it right now**. Sunbay chases every record whose `amountOutstanding` is positive and never recomputes balances from correction chains, which is what keeps the feed safe against double counting: a credit note that has already reduced its original must not reduce it a second time on Sunbay's side. So expose the settled state, not the arithmetic - one rule governs how a not-yet-settled credit is handled, and it follows next.
+
+**No unapplied credit may sit next to a chased document.** Sunbay does not sum records, so any reduction the debtor is entitled to must already be visible in the `amountOutstanding` of the document being chased. If your system clears credit notes against their originals, this happens by itself. If it keeps both as separate open items, the integration layer applies the clearing before exposing the data: the original's `amountOutstanding` is reduced by the credit, and whatever the original cannot absorb stays on the credit note as a negative open amount - a refund your side owes. Without this Sunbay would demand the original's full amount while the offsetting credit sat unread beside it. **Positive** adjustments are the opposite case: a debit note or an increasing correction stands as a receivable of its own, with its own positive `amountOutstanding`, and is chased in its own right.
 
 **Amounts on adjusting documents are the document's own amounts, signed.** `amountNet` / `amountVat` / `amountGross` carry the **difference** the document introduces, with its sign: **negative** reduces what the debtor owes, **positive** increases it. If your source system stores a correction as new corrected totals or as "before/after", the integration layer derives the signed difference. Do not send absolute values with the direction implied by the document type or by the accounting side of the entry - a `CorrectiveInvoice` goes both ways, so an unsigned amount is not interpretable.
 
-`correctedInvoiceId` is what links the two records: it lets a reminder quote the original invoice number next to the correction, and it groups them for analytics. The referenced original must also reach Sunbay - see §4.5 (Option A) and §5.3 (Option B). How your source system expresses correction amounts is confirmed during onboarding (§10).
+Where it is present, `correctedInvoiceId` is what links the two records: it lets a reminder quote the original invoice number next to the correction, and it groups them for analytics. The referenced original must also reach Sunbay - see §4.5 (Option A) and §5.3 (Option B). How your source system expresses correction amounts is confirmed during onboarding (§10).
 
 #### 3.1.3 `invoiceNumber` is not a unique key
 
@@ -153,7 +155,9 @@ This is accepted, but it has a visible consequence: the debtor holds one documen
 | `amountPaid` | decimal | **Yes** | Amount settled against this document by payments (`0` if none). Enables partial-payment handling. **Never clamped** to `amountGross` - see overpayments below. |
 | `amountOutstanding` | decimal | **Yes** | **The open amount of this document in your source system, right now.** This is the authoritative value and what collection chases. It is normally `amountGross - amountPaid`, but not always: adjusting documents netted against this one change it without touching `amountPaid` (§3.1.2), and cancelled documents report `0` (§3.3). |
 
-**Signs.** `amountNet` / `amountVat` / `amountGross` are non-negative on ordinary documents and signed on adjusting documents (§3.1.2). `amountOutstanding` may be **negative on any document** - an overpaid invoice, or a credit note that has not been netted yet. Sunbay chases **only positive** `amountOutstanding`.
+**Signs.** `amountNet` / `amountVat` / `amountGross` are non-negative on ordinary documents and signed on adjusting documents (§3.1.2). `amountOutstanding` may be **negative on any document** - an overpaid invoice, or a credit note whose refund is still owed. Sunbay chases **only positive** `amountOutstanding`.
+
+`amountPaid` carries the **same sign as the document it belongs to**: a refund paid out against a credit note is a negative `amountPaid`. That keeps `|amountPaid|` and `|amountGross|` comparable in the status rules (§3.3).
 
 **Overpayments.** When more is received than was invoiced, do **not** clamp. `amountPaid` carries the full amount actually received, and `amountOutstanding` goes **negative** by the surplus; `status` is `Paid`. Capping `amountPaid` at `amountGross` silently deletes the surplus from the feed and is not acceptable - the overpayment is real information about the debtor's account.
 
@@ -227,7 +231,7 @@ One PDF per invoice. PDF specifics (always available? maximum size? PDFs for cor
 
 ### 3.8 Line items (optional)
 
-Invoice line items are **optional but valuable** - they enable richer analytics and more informative reminder content. The invoice is fully usable without them; when PDFs are exchanged, the PDF remains the authoritative document.
+Invoice line items are **optional but valuable** - they enable richer analytics and more informative reminder content. The invoice is fully usable without them; when PDFs are exchanged, the PDF remains the authoritative document. On an adjusting document the lines carry the same signed differences as the header (§3.1.2).
 
 If provided, `lineItems` is an array where each line carries:
 
@@ -338,16 +342,17 @@ This is the contract Sunbay's fetcher will code against. **Host and base path ar
 ### 4.2 List invoices
 
 ```
-GET {baseUrl}/invoices?modifiedSince=2026-01-24T09:30:00Z&page=1&pageSize=100
+GET {baseUrl}/invoices?modifiedSince=2026-01-24T09:30:00Z&modifiedUntil=2026-01-24T10:00:00Z&page=1&pageSize=100
 Authorization: <see §7.2>
 Accept: application/json
 ```
 
-Query parameters (all optional):
+Query parameters (Sunbay may omit any of them; all must be supported):
 
 | Parameter | Type | Semantics |
 |---|---|---|
-| `modifiedSince` | ISO-8601 UTC timestamp | Return only invoices with `lastModifiedAt >= modifiedSince` (**inclusive**). When omitted, return a **full snapshot**: all `Open` / `PartiallyPaid` invoices plus `Paid` / `Cancelled` ones within the agreed history window (§10). |
+| `modifiedSince` | ISO-8601 UTC timestamp | Lower bound, **inclusive**: return only invoices with `lastModifiedAt >= modifiedSince`. When omitted, return a **full snapshot**: all `Open` / `PartiallyPaid` invoices, `Paid` / `Cancelled` ones within the agreed history window (§10), and any invoice referenced by `correctedInvoiceId` from a record in the snapshot, regardless of its age (§4.5, route a). |
+| `modifiedUntil` | ISO-8601 UTC timestamp | Upper bound, **exclusive**: return only invoices with `lastModifiedAt < modifiedUntil`. Sunbay sets it to the instant the crawl started, which freezes the result set for the whole crawl. On your side it is one extra condition in the query. |
 | `page` | integer | 1-based page number. Default `1`. |
 | `pageSize` | integer | Maximum items per page. Default `100`; the server may cap it (suggested cap `500`). |
 
@@ -365,10 +370,10 @@ Response `200 OK`, `application/json`:
 - `items` - full invoice objects (§3.9 shape), field names 1:1.
 - `page` / `pageSize` - echo the request. Sunbay walks pages until a page returns fewer than `pageSize` items (or `page * pageSize` reaches `totalCount`).
 - `totalCount` - total number of matching invoices. **Recommended** - it lets Sunbay size the crawl; if omitted, Sunbay simply stops when a page returns fewer than `pageSize` items.
-- **Ordering:** return results ordered by `(lastModifiedAt, invoiceId)` ascending. A stable total order keeps paging deterministic within a crawl and lets an interrupted crawl resume.
-- **Why plain page numbers (not opaque cursors):** they are trivial for you to implement (`LIMIT`/`OFFSET`, `Skip`/`Take`). Under heavy concurrent modification, page-number paging can occasionally skip a row whose position shifts between page reads - which is acceptable here: `invoiceId` idempotency (§8) makes any duplicates harmless, and the periodic full-snapshot crawl (§4.5) reconciles anything missed.
+- **Ordering:** return results ordered by `(lastModifiedAt, invoiceId)` ascending. Together with `modifiedUntil` this is what makes a crawl deterministic: the matching set is frozen for its whole duration, so paging can neither skip nor repeat a row, and an interrupted crawl resumes on the same page boundaries.
+- **Why plain page numbers (not opaque cursors):** they are trivial for you to implement (`LIMIT`/`OFFSET`, `Skip`/`Take`), and bounding the set with `modifiedUntil` makes them safe: a record modified mid-crawl leaves the window instead of shifting position within it, so no row is pushed past a page boundary unread. Should a crawl ever run against an unbounded set, `invoiceId` idempotency (§8) keeps duplicates harmless and the periodic full-snapshot crawl (§4.5) reconciles anything missed.
 
-**Incremental fetching (watermarking).** After each completed crawl Sunbay stores the highest `lastModifiedAt` seen, and polls next with `modifiedSince = watermark - small overlap` (a few minutes). Any duplicates this causes are harmless - `invoiceId` idempotency (§8) makes re-processing a safe update. Your obligations: every data change bumps `lastModifiedAt`, the filter is inclusive, and timestamps are UTC.
+**Incremental fetching (watermarking).** Sunbay picks a crawl instant `T`, calls with `modifiedUntil = T` and `modifiedSince = previous watermark - small overlap` (a few minutes), and on a completed crawl stores `T` as the new watermark. Bounding the top end is what makes the watermark trustworthy: everything below `T` has been served, so a record modified while the crawl was running is not skipped - it simply belongs to the next one. The small overlap re-reads a few records, which is harmless: `invoiceId` idempotency (§8) makes re-processing a safe update. Your obligations: every data change bumps `lastModifiedAt`, `modifiedSince` is inclusive and `modifiedUntil` exclusive, and timestamps are UTC.
 
 ### 4.3 Invoice PDF (optional)
 
@@ -413,7 +418,7 @@ Returns `200 OK` with one invoice object (§3), or `404` if unknown. Used for sp
 ### 4.7 Example exchange
 
 ```
-GET /sunbay/v1/invoices?modifiedSince=2026-01-24T09:30:00Z&page=1&pageSize=100
+GET /sunbay/v1/invoices?modifiedSince=2026-01-24T09:30:00Z&modifiedUntil=2026-01-24T10:00:00Z&page=1&pageSize=100
 Authorization: Bearer eyJhbGciOi...
 Accept: application/json
 ```
@@ -569,7 +574,7 @@ The method is agreed during onboarding and aligned with your security policy:
 **Option A - Sunbay retries**
 
 - Transient failures, timeouts and `5xx` responses are retried with exponential backoff; `429` with `Retry-After` is honoured.
-- Your obligations: stable identifiers (`invoiceId`, `customer.id`), an **inclusive** `modifiedSince` filter, `lastModifiedAt` updated on every data change, a stable ordering by `(lastModifiedAt, invoiceId)` during a crawl, and cancellation tombstones (§4.5).
+- Your obligations: stable identifiers (`invoiceId`, `customer.id`), an **inclusive** `modifiedSince` and **exclusive** `modifiedUntil` filter, `lastModifiedAt` updated on every data change, a stable ordering by `(lastModifiedAt, invoiceId)` during a crawl, and cancellation tombstones plus reachable corrected originals (§4.5).
 - Brief outages are unproblematic - they only delay the next successful poll.
 - Ordering of adjusting documents is handled by Sunbay internally: if a correction appears before its original (e.g. across page boundaries), it is accepted and linked once the original arrives.
 
@@ -605,14 +610,14 @@ The method is agreed during onboarding and aligned with your security policy:
 **Common (both options)**
 
 1. **Stable identifiers** - does the source system expose a stable, unique id per **invoice** (`invoiceId`) and per **customer** (`customer.id`) that survives edits? What are they?
-2. **Corrections - storage** - how does the source system store adjusting documents: as separate documents with their own open amount, or as edits of the original? Does it net them against the original, or keep both as open items? (§3.1.2)
+2. **Corrections - storage** - how does the source system store adjusting documents: as separate documents with their own open amount, or as edits of the original? Does it clear credit notes against their originals, or keep both as open items - in which case the integration layer has to apply the clearing itself? (§3.1.2)
 3. **Corrections - sign** - can the signed difference be derived reliably? Does the sign in your system follow the accounting side of the entry, and can the same document kind carry both directions? (§3.1.2)
 4. **Split documents** - is one accounting document ever delivered as several receivables sharing an `invoiceNumber` (e.g. keyed per line item)? (§3.1.3)
 5. **Partial payments** - can `amountPaid` / `amountOutstanding` be provided, or only a binary paid flag?
 6. **Overpayments** - can a payment exceed the invoiced amount, and will the surplus be reported rather than clamped? (§3.2)
 7. **Cancelled documents** - can the source system produce the agreed shape (nominal `amountGross`, `amountOutstanding = 0`, truthful `amountPaid`)? (§3.3)
 8. **Blocking** - does the source system mark invoices that must not be chased (dispute, legal hold)? If not, how should such cases reach Sunbay - or is the field simply omitted? (§3.3)
-9. **Document types** - which document kinds exist and which are collectible; mapping of any kinds not listed in §3.1.1. Should proformas be excluded?
+9. **Document types** - which document kinds exist and which are collectible; mapping of any kinds not listed in §3.1.1. Proformas are never chased (§3.1.1) - should they be sent at all, for analytics?
 10. **Multi-company** - can one installation hold several legal entities/sellers? If so, how is the seller disambiguated?
 11. **Currencies** - are multi-currency invoices expected?
 12. **Volumes** - expected daily and peak invoice counts.
@@ -625,7 +630,7 @@ The method is agreed during onboarding and aligned with your security policy:
 16. API base URL, credential exchange and rotation procedure; chosen authentication method (§7.2).
 17. Your rate limits and maintenance windows.
 18. Initial load depth - how far back paid invoices are exposed (e.g. all open, plus paid within N months).
-19. `lastModifiedAt` semantics - which changes bump it, and with what precision?
+19. `lastModifiedAt` semantics - which changes bump it, and with what precision? Can the query support the `modifiedUntil` upper bound (§4.2)?
 20. Test/sandbox environment availability.
 21. Poll schedule - incremental interval and full-snapshot cadence (§9).
 
