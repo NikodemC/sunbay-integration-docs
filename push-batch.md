@@ -6,7 +6,7 @@ permalink: /push-batch/
 
 This page specifies the batch push endpoint as it is implemented: one HTTPS request carries a complete snapshot of the documents in scope. For integrations running on this endpoint it replaces the push proposal in §5 of the [integration guide](https://integration-docs.sunbay.io/).
 
-**Last change: 2026-10-29** - `correctedInvoiceId` replaced by `correctedInvoiceIds` (see [Changelog](#changelog)).
+**Last change: 2026-10-29** - 14-day window for closed documents also counts from `lastModifiedAt` (see [Changelog](#changelog)).
 
 ## Contents
 
@@ -55,7 +55,7 @@ Content-Type: application/json
 **Every request is a complete picture.** The accepted snapshot with the latest `generatedAt` replaces the previous one as a whole, so a document missing from it is no longer in scope. A snapshot contains:
 
 1. every document with an open amount (`Open`, `PartiallyPaid`), whatever its age;
-2. documents paid or cancelled within the agreed window (14 days);
+2. documents paid or cancelled within the agreed window (14 days): either `paidDate` or `lastModifiedAt` falls within the last 14 days. A settlement entered with an earlier `paidDate` therefore still appears at least once as closed;
 3. every invoice listed in `correctedInvoiceIds` of a document in the snapshot, whatever its age or status (§4).
 
 **Validation is all or nothing.** If any document fails, the whole request is rejected with `422`, nothing is stored and the previous snapshot stays in place. Sending the same snapshot again is safe.
@@ -74,7 +74,7 @@ All fields are top-level properties of the document. There are no nested `custom
 | `correctedInvoiceIds` | string[] | **Cond.** | Invoices a correction relates to (§4). |
 | `issueDate` | date | **Yes** | Issue date. |
 | `dueDate` | date | **Yes** | Due date. Required on every document. |
-| `lastModifiedAt` | timestamp | **Yes** | When the document last changed. ISO 8601 UTC ending in `Z`. |
+| `lastModifiedAt` | timestamp | **Yes** | When the last change was entered in the source system, not the business date of that change: a settlement entered on 22 October with a settlement date of 1 October has `lastModifiedAt` on 22 October. ISO 8601 UTC ending in `Z`. |
 
 **Amounts**
 
@@ -94,7 +94,7 @@ All fields are top-level properties of the document. There are no nested `custom
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `status` | string | **Yes** | `Open` · `PartiallyPaid` · `Paid` · `Cancelled`. Other values are accepted with a warning (§6). |
-| `paidDate` | date | **Opt.** | Date of full settlement. `null` while an amount is open, and on cancelled documents. |
+| `paidDate` | date | **Opt.** | Date of full settlement as booked, also when it is earlier than the day it was entered. `null` while an amount is open, and on cancelled documents. |
 | `isBlockedForCollection` | boolean | **Opt.** | `true` when the document must not be chased (dispute, legal hold). |
 
 **Customer**
@@ -289,4 +289,5 @@ Two invoices, a correction relating to both, and a bonus not related to a specif
 
 | Date | Change |
 |---|---|
+| 2026-10-29 | §2: a closed document is in the snapshot when its `paidDate` or its `lastModifiedAt` falls within the 14-day window, so a settlement entered with an earlier date still appears at least once as closed. §3: `lastModifiedAt` is when the change was entered, `paidDate` the settlement date as booked. |
 | 2026-10-29 | `correctedInvoiceId` (one string) replaced by `correctedInvoiceIds` (array). A correction lists every invoice it relates to, or `[]` when it relates to none. The old field is no longer part of the contract. |
